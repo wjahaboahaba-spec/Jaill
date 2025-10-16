@@ -1,0 +1,599 @@
+--[[ 
+  Auto Police + One-Button GUI (Draggable)
+  - ปุ่มเดียว เปิด/ปิด ได้ ลากย้ายตำแหน่งได้
+  - ไล่แบบติดเฟรม (วาร์ปใต้พื้น) + สแปมรีโมต
+  - เพิ่ม: ปิดแล้วกลับตำแหน่งเดิมที่กดเปิด / กันตามชื่อเดิมเกิน 2 ครั้ง
+]]--
+
+-- ====== Services ======
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+local VirtualInputManager = game:GetService("VirtualInputManager")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+
+-- ====== Config ======
+local START_POS = CFrame.new(771, 15, -22)
+local DROP_POS  = CFrame.new(851, 15, -18)
+local PATROL_POSITIONS = {
+	CFrame.new(635, 557, 1501),
+	CFrame.new(-857, 100, -1336),
+}
+local UNDER_OFFSET_STUDS = -11 -- ลึกใต้พื้นเป้าหมาย
+
+-- ขีดจำกัดการเลือกเป้าหมายซ้ำคนเดิม
+local MAX_REPEATS_PER_TARGET = 2         -- อนุญาตเลือกซ้ำได้ 2 ครั้ง; ครั้งที่ 3 จะข้าม
+local VISIT_TTL_SECONDS       = 180      -- ล้างเคาน์เตอร์ที่เก่ากว่า 180 วินาที
+
+-- ====== State (ใช้ shared เพื่อกันซ้ำ) ======
+shared.AutoPoliceEnabled = shared.AutoPoliceEnabled or false
+shared._AutoPoliceRunner = shared._AutoPoliceRunner or nil
+shared._AutoGuiPos = shared._AutoGuiPos or UDim2.new(0, 20, 0, 200)
+shared._ReturnCF = shared._ReturnCF or nil  -- ตำแหน่งตอน "กดเปิด" เพื่อวาร์ปกลับตอน "กดปิด"
+shared._ReturnCF = shared._ReturnCF or nil
+shared._UpsideConn = shared._UpsideConn or nil
+-- นับจำนวนครั้งที่เลือกเป้าต่อคน
+local VISITS_PER_TARGET = {}  -- [userId] = count
+local VISIT_TIMESTAMP   = {}  -- [userId] = os.clock() ล่าสุด
+
+-- ====== Utils ======
+local function waitForHRP(plr)
+	plr = plr or LocalPlayer
+	local char = plr.Character or plr.CharacterAdded:Wait()
+	local hrp = char:FindFirstChild("HumanoidRootPart") or char:WaitForChild("HumanoidRootPart")
+	return char, hrp
+end
+-- ===== กลับหัวตัวละคร (Toggle) =====
+shared._UpsideDown = shared._UpsideDown or false
+
+local function setUpsideDown(enable)
+    local char, hrp = waitForHRP(LocalPlayer)
+    local hum = char:FindFirstChildOfClass("Humanoid")
+
+    -- เคลียร์ของเดิมก่อน
+    local oldAO = hrp:FindFirstChild("UpsideDownAlign")
+    local oldAtt = hrp:FindFirstChild("UpsideDownAtt")
+    if oldAO then oldAO:Destroy() end
+    if oldAtt then oldAtt:Destroy() end
+
+    if not enable then
+        if hum then hum.AutoRotate = true end
+        -- ปล่อยให้ Humanoid ตั้งตัวตรงเอง
+        return
+    end
+
+    if hum then hum.AutoRotate = false end
+
+    local att = Instance.new("Attachment")
+    att.Name = "UpsideDownAtt"
+    att.Parent = hrp
+
+    local ao = Instance.new("AlignOrientation")
+    ao.Name = "UpsideDownAlign"
+    ao.Attachment0 = att
+    ao.Mode = Enum.OrientationAlignmentMode.OneAttachment
+    ao.Responsiveness = 200
+    ao.MaxTorque = math.huge
+    ao.ReactionTorqueEnabled = false
+    ao.RigidityEnabled = true
+    -- หมุนกลับหัว 180 องศา (roll)
+    ao.CFrame = CFrame.Angles(0, 0, math.pi)
+    ao.Parent = hrp
+end
+
+
+local function safeTeleport(cf)
+	local ok = pcall(function()
+		local _, hrp = waitForHRP(LocalPlayer)
+		hrp.CFrame = cf
+	end)
+	if not ok then warn("[Teleport] failed") end
+end
+
+local function pressE()
+	VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.E, false, game)
+	task.wait(0.045)
+	VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+end
+
+-- noclip กันชนเวลาวาร์ปเร็ว ๆ
+local function startNoclip()
+	local conn
+	conn = RunService.Heartbeat:Connect(function()
+		local char = LocalPlayer.Character
+		if not char then return end
+		for _, p in ipairs(char:GetDescendants()) do
+			if p:IsA("BasePart") then p.CanCollide = false end
+		end
+	end)
+	return conn
+end
+-- ตรวจทุก ๆ 1 วิ ว่ายังเป็นตำรวจ + มีกุญแจมืออยู่ไหม
+local function startReadinessGuardian()
+	if shared._ReadyGuard then return end -- กันซ้ำ
+	shared._ReadyGuard = task.spawn(function()
+		while shared.AutoPoliceEnabled do
+			if (not isPolice()) or (not findHandcuffsAnywhere()) then
+				-- ถ้าหลุดสถานะใด ๆ ให้ทำขั้นตอนสมัคร/รับกุญแจมือก่อนเสมอ
+				ensureReadyLoop()
+			end
+			task.wait(1) -- ตรวจทุก 1 วินาที
+		end
+		shared._ReadyGuard = nil
+	end)
+end
+
+-- ===== Handcuffs: ไม่ต้อง "ถือ" =====
+local function findHandcuffsAnywhere()
+	local char = LocalPlayer.Character
+	local bp   = LocalPlayer:FindFirstChild("Backpack")
+	local wsByName = workspace:FindFirstChild(LocalPlayer.Name)
+	local wsLocal  = workspace:FindFirstChild("LocalPlayer")
+
+	local candidates = {
+		char and char:FindFirstChild("Handcuffs"),
+		bp   and bp:FindFirstChild("Handcuffs"),
+		wsByName and wsByName:FindFirstChild("Handcuffs"),
+		wsLocal  and wsLocal:FindFirstChild("Handcuffs"),
+	}
+	for _, inst in ipairs(candidates) do
+		if inst then return inst end
+	end
+	for _, root in ipairs({char, bp, wsByName, wsLocal}) do
+		if root then
+			for _, d in ipairs(root:GetDescendants()) do
+				if d:IsA("Tool") and d.Name == "Handcuffs" then
+					return d
+				end
+			end
+		end
+	end
+	return nil
+end
+
+local function getCuffRemote(tool)
+	tool = tool or findHandcuffsAnywhere()
+	if not tool then return nil end
+	return tool:FindFirstChildWhichIsA("RemoteFunction", true)
+end
+
+local function findCarryingValue()
+	local char = LocalPlayer.Character
+	local bp   = LocalPlayer:FindFirstChild("Backpack")
+	local wsByName = workspace:FindFirstChild(LocalPlayer.Name)
+	local wsLocal  = workspace:FindFirstChild("LocalPlayer")
+
+	local roots = {char, bp, wsByName, wsLocal}
+	for _, root in ipairs(roots) do
+		if root then
+			local cuffs = root:FindFirstChild("Handcuffs")
+			if cuffs then
+				local sv = cuffs:FindFirstChild("Carrying") or cuffs:FindFirstChildWhichIsA("StringValue", true)
+				if sv and sv:IsA("StringValue") and sv.Name == "Carrying" then return sv end
+			end
+			for _, d in ipairs(root:GetDescendants()) do
+				if d:IsA("StringValue") and d.Name == "Carrying" then return d end
+			end
+		end
+	end
+	return nil
+end
+
+-- ===== Police status =====
+local function getPoliceIcon()
+	local char = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+	local head = char:FindFirstChild("Head")
+	if head then
+		local nt = head:FindFirstChild("NameTag")
+		if nt then
+			local ic = nt:FindFirstChild("Icons")
+			if ic then
+				local p = ic:FindFirstChild("Police")
+				if p and p:IsA("GuiObject") then return p end
+			end
+		end
+	end
+	local wsByName = workspace:FindFirstChild(LocalPlayer.Name) or workspace:FindFirstChild("LocalPlayer")
+	if wsByName then
+		local h = wsByName:FindFirstChild("Head")
+		if h then
+			local nt = h:FindFirstChild("NameTag")
+			local ic = nt and nt:FindFirstChild("Icons")
+			local p = ic and ic:FindFirstChild("Police")
+			if p and p:IsA("GuiObject") then return p end
+		end
+	end
+	return nil
+end
+
+local function isPolice()
+	local icon = getPoliceIcon()
+	return icon and icon.Visible == true
+end
+
+-- วนลูปจน "เป็นตำรวจ + มีกุญแจมือ"
+local function ensureReadyLoop()
+	while true do
+		local policeOK = isPolice()
+		local cuffsOK  = (findHandcuffsAnywhere() ~= nil)
+
+		if policeOK and cuffsOK then
+			return true
+		end
+
+		if not policeOK then
+			safeTeleport(START_POS)
+			task.wait(1.5)
+			pressE()
+			task.wait(1)
+		end
+
+		cuffsOK = (findHandcuffsAnywhere() ~= nil)
+		if not cuffsOK then
+			safeTeleport(START_POS)
+			task.wait(2.1)
+			pressE()
+			task.wait(1)
+		end
+	end
+end
+
+-- ===== Wanted list (refresh 1s) =====
+local WANTED_CACHE, LAST_WANTED_REFRESH = {}, 0
+local function GetWantedPlayers()
+	local wanted = {}
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= LocalPlayer then
+			local char = plr.Character
+			local head = char and char:FindFirstChild("Head")
+			local nt   = head and head:FindFirstChild("NameTag")
+			local w    = nt and nt:FindFirstChild("WANTED")
+			if w and w:IsA("GuiObject") and w.Visible == true then
+				table.insert(wanted, plr)
+			end
+		end
+	end
+	return wanted
+end
+
+local function refreshWantedList()
+	if os.clock() - LAST_WANTED_REFRESH >= 1 then
+		WANTED_CACHE = GetWantedPlayers()
+		LAST_WANTED_REFRESH = os.clock()
+	end
+end
+
+-- ===== เลือกเป้าหมาย: เลี่ยงคนที่ถูกเลือกครบโควตาแล้ว =====
+local function cleanOldVisits()
+	for userId, ts in pairs(VISIT_TIMESTAMP) do
+		if os.clock() - ts > VISIT_TTL_SECONDS then
+			VISIT_TIMESTAMP[userId] = nil
+			VISITS_PER_TARGET[userId] = nil
+		end
+	end
+end
+
+local function visitCount(plr)
+	if not plr then return 0 end
+	return VISITS_PER_TARGET[plr.UserId] or 0
+end
+
+local function markVisit(plr)
+	if not plr then return end
+	VISITS_PER_TARGET[plr.UserId] = (VISITS_PER_TARGET[plr.UserId] or 0) + 1
+	VISIT_TIMESTAMP[plr.UserId] = os.clock()
+end
+
+local function pickWantedSmart()
+	refreshWantedList()
+	cleanOldVisits()
+	if #WANTED_CACHE == 0 then return nil end
+
+	-- ลองสุ่มหาเป้าที่ยังไม่ถึงโควตา
+	local tried = {}
+	for i = 1, #WANTED_CACHE do
+		local idx
+		repeat idx = math.random(1, #WANTED_CACHE) until not tried[idx]
+		tried[idx] = true
+
+		local p = WANTED_CACHE[idx]
+		if visitCount(p) < MAX_REPEATS_PER_TARGET then
+			return p
+		end
+	end
+
+	-- ถ้าทุกคนครบโควตาแล้ว: รีเคาน์เตอร์ แล้วเลือกสุ่ม
+	table.clear(VISITS_PER_TARGET); table.clear(VISIT_TIMESTAMP)
+	return WANTED_CACHE[math.random(1, #WANTED_CACHE)]
+end
+
+-- ===== ไล่และจับ (ติดเฟรม + สแปมรีโมต) =====
+local function getTargetCFrame(targetChar)
+	if not targetChar then return nil end
+	local hrp = targetChar:FindFirstChild("HumanoidRootPart")
+	if hrp and hrp:IsA("BasePart") then return hrp.CFrame end
+	local torso = targetChar:FindFirstChild("LowerTorso")
+		or targetChar:FindFirstChild("UpperTorso")
+		or targetChar:FindFirstChild("Torso")
+	if torso and torso:IsA("BasePart") then return torso.CFrame end
+	if targetChar.PrimaryPart and targetChar.PrimaryPart:IsA("BasePart") then
+		return targetChar.PrimaryPart.CFrame
+	end
+	if targetChar.GetPivot then
+		local ok, cf = pcall(function() return targetChar:GetPivot() end)
+		if ok and typeof(cf) == "CFrame" then return cf end
+	end
+	local sum = Vector3.zero
+	local count = 0
+	for _, p in ipairs(targetChar:GetDescendants()) do
+		if p:IsA("BasePart") then sum += p.Position; count += 1 end
+	end
+	if count > 0 then
+		local pos = sum / count
+		local look = (workspace.CurrentCamera and workspace.CurrentCamera.CFrame.LookVector) or Vector3.zAxis
+		return CFrame.new(pos, pos + look)
+	end
+	return nil
+end
+
+local function startStickyChase(targetPlr, offsetCF)
+	offsetCF = offsetCF or CFrame.new(0, UNDER_OFFSET_STUDS, 0)
+	local stopped = false
+	local conn = RunService.RenderStepped:Connect(function()
+		if stopped then return end
+		local tChar = targetPlr.Character
+		local tCF   = tChar and getTargetCFrame(tChar)
+		if not tCF then return end
+		local _, myHRP = waitForHRP(LocalPlayer)
+		if not myHRP then return end
+		myHRP.CFrame = tCF * offsetCF
+		if myHRP.AssemblyLinearVelocity then myHRP.AssemblyLinearVelocity = Vector3.new() end
+		if myHRP.AssemblyAngularVelocity then myHRP.AssemblyAngularVelocity = Vector3.new() end
+	end)
+	return { stop = function() if conn then conn:Disconnect() end stopped = true end }
+end
+
+local function arrestByRemoteSpam(targetPlr, timeoutSec)
+	timeoutSec = timeoutSec or 5
+	local t0 = os.clock()
+
+	ensureReadyLoop()
+	local tool = findHandcuffsAnywhere()
+	local remote = getCuffRemote(tool)
+	if not remote then
+		warn("❌ ไม่พบ RemoteFunction ใต้ Handcuffs")
+		return false
+	end
+
+	local noclipConn = startNoclip()
+	local stick = startStickyChase(targetPlr, CFrame.new(0, UNDER_OFFSET_STUDS, 0))
+
+	while shared.AutoPoliceEnabled and (os.clock() - t0 < timeoutSec) do
+		if not isPolice() or not findHandcuffsAnywhere() then
+			ensureReadyLoop()
+			tool = findHandcuffsAnywhere()
+			remote = getCuffRemote(tool) or remote
+			if not remote then break end
+		end
+
+		pcall(function()
+			remote:InvokeServer(targetPlr)
+		end)
+
+		local carrying = findCarryingValue()
+		if carrying and carrying.Value == targetPlr.Name then
+			if stick then stick.stop() end
+			if noclipConn then noclipConn:Disconnect() end
+			return true
+		end
+
+		task.wait(0.03)
+	end
+
+	if stick then stick.stop() end
+	if noclipConn then noclipConn:Disconnect() end
+	return false
+end
+
+-- ===== Respawn + ทำตำรวจใหม่ =====
+local function respawnAndRePolice()
+	pcall(function()
+		ReplicatedStorage:WaitForChild("Events"):WaitForChild("OnDeathEvent"):FireServer("LoadCharacter")
+	end)
+	LocalPlayer.CharacterAdded:Wait()
+	waitForHRP(LocalPlayer)
+	task.wait(0.2)
+	ensureReadyLoop()
+end
+
+-- ===== ลูปหลัก (เช็กแฟล็กเพื่อหยุดได้) =====
+local function mainLoop()
+	safeTeleport(START_POS)
+	task.wait(1.5)
+	pressE()
+	task.wait(1.5)
+	ensureReadyLoop()
+
+	while shared.AutoPoliceEnabled do
+		ensureReadyLoop()
+		local target = pickWantedSmart()
+		if not target then
+			local patrolCF = PATROL_POSITIONS[math.random(1, #PATROL_POSITIONS)]
+			safeTeleport(patrolCF)
+			task.wait(0.8)
+		else
+			-- นับว่ากำลังตามคนนี้อีก 1 ครั้ง (กันครั้งที่ 3)
+			markVisit(target)
+
+			local ok = arrestByRemoteSpam(target, 5)
+			if ok then
+				safeTeleport(DROP_POS)
+				task.wait(1)
+			else
+				respawnAndRePolice()
+			end
+		end
+	end
+end
+
+-- ===== GUI =====
+local function getGuiParent()
+	local parent = nil
+	pcall(function() if typeof(gethui) == "function" then parent = gethui() end end)
+	parent = parent or game:GetService("CoreGui") or LocalPlayer:WaitForChild("PlayerGui")
+	return parent
+end
+
+local function makeToggleGui()
+	if shared._AutoPoliceGui and shared._AutoPoliceGui.Parent then
+		shared._AutoPoliceGui:Destroy()
+	end
+
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "AutoPoliceToggleGui"
+	gui.ResetOnSpawn = false
+	gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	gui.Parent = getGuiParent()
+
+	local root = Instance.new("Frame")
+	root.Name = "NEXON_HUB_Float"
+	root.Parent = gui
+	root.AnchorPoint = Vector2.new(0, 0)
+	root.Position = shared._AutoGuiPos
+	root.Size = UDim2.new(0, 200, 0, 90)
+	root.BackgroundColor3 = Color3.fromRGB(23, 26, 36)
+	Instance.new("UICorner", root).CornerRadius = UDim.new(0, 12)
+	local rootStroke = Instance.new("UIStroke", root)
+	rootStroke.Thickness = 1.6
+	rootStroke.Color = Color3.fromRGB(80, 180, 255)
+
+	local titleBar = Instance.new("Frame")
+	titleBar.Parent = root
+	titleBar.BackgroundColor3 = Color3.fromRGB(30, 34, 48)
+	titleBar.Size = UDim2.new(1, 0, 0, 30)
+	Instance.new("UICorner", titleBar).CornerRadius = UDim.new(0, 12)
+
+	local titleLabel = Instance.new("TextLabel")
+	titleLabel.Parent = titleBar
+	titleLabel.BackgroundTransparency = 1
+	titleLabel.Size = UDim2.new(1, -16, 1, 0)
+	titleLabel.Position = UDim2.new(0, 60, 0, 0)
+	titleLabel.Font = Enum.Font.GothamBold
+	titleLabel.TextSize = 16
+	titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+	titleLabel.Text = "NEXON HUB"
+	titleLabel.TextColor3 = Color3.fromRGB(200, 220, 255)
+
+	local btn = Instance.new("TextButton")
+	btn.Parent = root
+	btn.AnchorPoint = Vector2.new(0.5, 0)
+	btn.Position = UDim2.new(0.5, 0, 0, 42)
+	btn.Size = UDim2.new(0, 140, 0, 36)
+	btn.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+	btn.AutoButtonColor = true
+	btn.Font = Enum.Font.GothamBold
+	btn.TextSize = 20
+
+
+	local btnCorner = Instance.new("UICorner", btn)
+	btnCorner.CornerRadius = UDim.new(0, 10)
+	local btnStroke = Instance.new("UIStroke", btn)
+	btnStroke.Thickness = 1.6
+	btnStroke.Color = Color3.fromRGB(80, 180, 255)
+
+	local function updateVisual()
+		btn.Text = shared.AutoPoliceEnabled and "จับโจร: เปิด" or "จับโจร: ปิด"
+		btn.BackgroundColor3 = shared.AutoPoliceEnabled and Color3.fromRGB(32, 120, 60) or Color3.fromRGB(25, 29, 40)
+		local c = shared.AutoPoliceEnabled and Color3.fromRGB(120, 255, 150) or Color3.fromRGB(80, 180, 255)
+		btnStroke.Color, rootStroke.Color = c, c
+	end
+	updateVisual()
+
+	-- Drag ทั้งกรอบ
+	local dragging = false
+	local dragStart, startPos
+	local function beginDrag(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			dragStart = input.Position
+			startPos = root.Position
+			local moveConn, endConn
+			moveConn = UserInputService.InputChanged:Connect(function(i)
+				if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+					local delta = i.Position - dragStart
+					local newPos = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+					root.Position = newPos
+					shared._AutoGuiPos = newPos
+				end
+			end)
+			endConn = UserInputService.InputEnded:Connect(function(i)
+				if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+					dragging = false
+					if moveConn then moveConn:Disconnect() end
+					if endConn  then endConn:Disconnect()  end
+				end
+			end)
+		end
+	end
+	root.InputBegan:Connect(beginDrag); titleBar.InputBegan:Connect(beginDrag)
+
+btn.MouseButton1Click:Connect(function()
+    local willEnable = not shared.AutoPoliceEnabled
+
+    if willEnable then
+        -- จำตำแหน่งไว้เพื่อกลับตอนกดปิด
+        local _, hrp = waitForHRP(LocalPlayer)
+        if hrp then shared._ReturnCF = hrp.CFrame end
+
+        -- รีเคาน์เตอร์
+        table.clear(VISITS_PER_TARGET); table.clear(VISIT_TIMESTAMP)
+
+        -- เปิดตัวคอยเฝ้า "เป็นตำรวจ+มีกุญแจมือ"
+        startReadinessGuardian()
+
+        -- ✅ กลับหัวทันที + รีผูกตอนรีสปาวน์
+        shared._UpsideDown = true
+        setUpsideDown(true)
+        if shared._UpsideConn then shared._UpsideConn:Disconnect() end
+        shared._UpsideConn = LocalPlayer.CharacterAdded:Connect(function()
+            -- รอให้ HRP โผล่ก่อนแล้วค่อยกลับหัวใหม่
+            task.wait(0.1)
+            if shared.AutoPoliceEnabled and shared._UpsideDown then
+                setUpsideDown(true)
+            end
+        end)
+    end
+
+    shared.AutoPoliceEnabled = willEnable
+    updateVisual()
+
+    if shared.AutoPoliceEnabled then
+        if not shared._AutoPoliceRunner then
+            shared._AutoPoliceRunner = task.spawn(function()
+                local ok, err = pcall(mainLoop)
+                if not ok then warn("[AutoPoliceRunner] ", err) end
+                shared._AutoPoliceRunner = nil
+                shared.AutoPoliceEnabled = false
+                updateVisual()
+            end)
+        end
+    else
+        -- ❌ ปิดฟีเจอร์ → เลิกกลับหัว + ยกเลิกคอนเนกชัน
+        shared._UpsideDown = false
+        if shared._UpsideConn then shared._UpsideConn:Disconnect(); shared._UpsideConn = nil end
+        setUpsideDown(false)
+
+        -- วาร์ปกลับตำแหน่งที่กดเปิด
+        if shared._ReturnCF then
+            safeTeleport(shared._ReturnCF)
+        end
+    end
+end)
+
+
+	shared._AutoPoliceGui = gui
+end
+
+-- ===== Boot GUI =====
+makeToggleGui()
