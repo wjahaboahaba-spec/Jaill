@@ -398,14 +398,23 @@ end
 
 -- ===== Respawn + ทำตำรวจใหม่ =====
 local function respawnAndRePolice()
-	pcall(function()
-		ReplicatedStorage:WaitForChild("Events"):WaitForChild("OnDeathEvent"):FireServer("LoadCharacter")
-	end)
-	LocalPlayer.CharacterAdded:Wait()
-	waitForHRP(LocalPlayer)
-	task.wait(0.2)
-	ensureReadyLoop()
+    pcall(function()
+        local args = {
+            [1] = "LoadCharacter"
+        }
+
+        game:GetService("ReplicatedStorage")
+        :WaitForChild("Events")
+        :WaitForChild("OnDeathEvent")
+        :FireServer(unpack(args))
+    end)
+
+    LocalPlayer.CharacterAdded:Wait()
+    waitForHRP(LocalPlayer)
+    task.wait(0.2)
+    ensureReadyLoop()
 end
+
 
 -- ===== ลูปหลัก (เช็กแฟล็กเพื่อหยุดได้) =====
 local function mainLoop()
